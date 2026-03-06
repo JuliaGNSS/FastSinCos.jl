@@ -6,12 +6,13 @@ Ported from [SLEEF](https://github.com/shibatch/sleef) polynomial approximations
 
 ## Functions
 
-Two accuracy variants are provided:
+Three accuracy variants are provided:
 
 | Function | Accuracy | Speed | Best for |
 |----------|----------|-------|----------|
-| [`fast_sincos_u3500`](@ref) | ~3500 ULP | Fastest | Small inputs (`|d| ≲ 100`), maximum throughput |
-| [`fast_sincos_u35`](@ref) | ~35 ULP | Fast | Any input range, when accuracy matters |
+| [`fast_sincos_u100k`](@ref) | ~100,000 ULP (~3e-4) | Fastest (~27% faster) | When ~3e-4 error is acceptable |
+| [`fast_sincos_u3500`](@ref) | ~3500 ULP (~3.6e-6) | ~15% faster | When ~3.6e-6 error is acceptable |
+| [`fast_sincos_u35`](@ref) | ~35 ULP (~6e-8) | Fast | When accuracy matters |
 
 Both operate on `SIMD.Vec{N,Float32}` and return `(sin, cos)` as a tuple of vectors.
 
@@ -76,11 +77,12 @@ end
 
 ### Choosing a variant
 
-- Use [`fast_sincos_u3500`](@ref) when inputs are small (`|d| ≲ 100`) and you need
-  maximum speed. Typical use case: GNSS carrier generation where phases are
-  wrapped to `[-π, π]`.
-- Use [`fast_sincos_u35`](@ref) when inputs can be large or accuracy matters.
-  The Cody-Waite range reduction keeps error flat at ~6e-8 even for `|d| > 10⁶`.
+- Use [`fast_sincos_u100k`](@ref) for maximum throughput when ~3e-4 error is acceptable.
+- Use [`fast_sincos_u3500`](@ref) when ~3.6e-6 max error is acceptable and you want
+  ~15% more throughput. Typical use case: GNSS carrier generation.
+- Use [`fast_sincos_u35`](@ref) when accuracy matters (~6e-8 max error).
+
+All variants use Cody-Waite range reduction, so error is flat across all input ranges.
 
 ### Performance tips
 
@@ -93,16 +95,18 @@ end
 
 ## Accuracy vs input range
 
-The `u3500` variant uses single-precision range reduction, so its error grows
-linearly with input magnitude. The `u35` variant uses Cody-Waite range reduction
-and maintains ~6e-8 absolute error across the entire valid range:
+All variants use Cody-Waite range reduction, so error stays flat across all input
+ranges. The difference is in the polynomial order: `u100k` uses 2+2 coefficients
+(~3e-4 max error), `u3500` uses 3+3 coefficients (~3.6e-6 max error), and `u35`
+uses 3+5 coefficients (~6e-8 max error):
 
 ```@example accuracy
 using FastSinCos, SIMD, CairoMakie
 
-function max_abs_error(sincos_fn, range_max; n=10000)
-    max_sin_err = 0.0
-    max_cos_err = 0.0
+using Statistics
+
+function error_stats(sincos_fn, range_max; n=10000)
+    errs = Float64[]
     for _ in 1:n÷8
         vals = ntuple(_ -> Float32(rand() * 2 * range_max - range_max), 8)
         v = SIMD.Vec{8,Float32}(vals)
@@ -112,48 +116,67 @@ function max_abs_error(sincos_fn, range_max; n=10000)
         for i in 1:8
             ref_s = sin(Float64(vals[i]))
             ref_c = cos(Float64(vals[i]))
-            max_sin_err = max(max_sin_err, abs(Float64(s_tup[i]) - ref_s))
-            max_cos_err = max(max_cos_err, abs(Float64(c_tup[i]) - ref_c))
+            push!(errs, max(abs(Float64(s_tup[i]) - ref_s), abs(Float64(c_tup[i]) - ref_c)))
         end
     end
-    return max(max_sin_err, max_cos_err)
+    p25 = quantile(errs, 0.25)
+    p50 = quantile(errs, 0.50)
+    p75 = quantile(errs, 0.75)
+    return p25, p50, p75, maximum(errs)
 end
 
 ranges = [10, 30, 100, 300, 1_000, 3_000, 10_000, 30_000, 100_000, 1_000_000]
-err_u3500 = [max_abs_error(fast_sincos_u3500, r) for r in ranges]
-err_u35 = [max_abs_error(fast_sincos_u35, r) for r in ranges]
+stats_u100k = [error_stats(fast_sincos_u100k, r) for r in ranges]
+stats_u3500 = [error_stats(fast_sincos_u3500, r) for r in ranges]
+stats_u35 = [error_stats(fast_sincos_u35, r) for r in ranges]
+p25_u100k = [s[1] for s in stats_u100k]
+p50_u100k = [s[2] for s in stats_u100k]
+p75_u100k = [s[3] for s in stats_u100k]
+p25_u3500 = [s[1] for s in stats_u3500]
+p50_u3500 = [s[2] for s in stats_u3500]
+p75_u3500 = [s[3] for s in stats_u3500]
+p25_u35 = [s[1] for s in stats_u35]
+p50_u35 = [s[2] for s in stats_u35]
+p75_u35 = [s[3] for s in stats_u35]
 
 fig = Figure(size=(700, 400))
 ax = Axis(fig[1, 1];
     xlabel="|d| max input range",
-    ylabel="Max absolute error",
+    ylabel="Absolute error",
     xscale=log10, yscale=log10,
-    title="Accuracy degradation vs input range")
-scatterlines!(ax, Float64.(ranges), err_u3500; label="u3500", marker=:circle)
-scatterlines!(ax, Float64.(ranges), err_u35; label="u35", marker=:diamond)
+    title="Accuracy vs input range (median with 25th–75th percentile)")
+rx = Float64.(ranges)
+rangebars!(ax, rx, p25_u100k, p75_u100k; color=(:red, 0.3), whiskerwidth=8)
+scatterlines!(ax, rx, p50_u100k; label="u100k", marker=:utriangle, color=:red)
+rangebars!(ax, rx, p25_u3500, p75_u3500; color=(:dodgerblue, 0.3), whiskerwidth=8)
+scatterlines!(ax, rx, p50_u3500; label="u3500", marker=:circle, color=:dodgerblue)
+rangebars!(ax, rx, p25_u35, p75_u35; color=(:orange, 0.3), whiskerwidth=8)
+scatterlines!(ax, rx, p50_u35; label="u35", marker=:diamond, color=:orange)
 axislegend(ax; position=:lt)
 fig
 ```
 
-| `|d|` range | u3500 max error | u35 max error |
-|-------------|-----------------|---------------|
-| ±10 | 3.5e-6 | 6e-8 |
-| ±100 | 6e-6 | 6e-8 |
-| ±1,000 | 4e-5 | 6e-8 |
-| ±10,000 | 8e-4 | 7e-8 |
-| ±100,000 | 3e-3 | 6e-8 |
-| ±1,000,000 | 4e-2 | 6e-8 |
+Lines show median absolute error over 10,000 random samples; bars indicate 25th–75th percentile (IQR).
+All variants maintain flat error across all input ranges thanks to Cody-Waite range reduction.
+
+| ``\|d\|`` range | u100k median | u100k max | u3500 median | u3500 max | u35 median | u35 max |
+|-------------|--------------|-----------|--------------|-----------|------------|---------|
+| ±10 | 4.5e-6 | 3.2e-4 | 2.9e-8 | 3.6e-6 | 1.9e-8 | 6.2e-8 |
+| ±100 | 4.9e-6 | 3.2e-4 | 3.0e-8 | 3.6e-6 | 1.9e-8 | 5.8e-8 |
+| ±1,000 | 5.3e-6 | 3.2e-4 | 3.0e-8 | 3.6e-6 | 1.9e-8 | 6.3e-8 |
+| ±10,000 | 4.7e-6 | 3.2e-4 | 3.0e-8 | 3.6e-6 | 1.9e-8 | 6.3e-8 |
+| ±100,000 | 4.7e-6 | 3.2e-4 | 3.0e-8 | 3.6e-6 | 1.9e-8 | 6.2e-8 |
+| ±1,000,000 | 5.0e-6 | 3.6e-4 | 3.1e-8 | 4.2e-6 | 1.9e-8 | 6.1e-8 |
 
 ## Performance
 
 On a typical x86-64 CPU with AVX2 (Vec width 8), processing 25K Float32 samples
 in a downconvert workload:
 
-| Approach | Time |
-|----------|------|
-| FastSinCos u3500 (4x unrolled) | ~15 μs |
-| LoopVectorization @avx + SLEEF | ~17 μs |
-| FastSinCos u3500 (basic loop) | ~20 μs |
-| FastSinCos u35 (basic loop) | ~22 μs |
-| SIMD.jl built-in sin/cos | ~127 μs |
-| Base.sincos | ~370 μs |
+| Approach | Time | Max error |
+|----------|------|-----------|
+| FastSinCos u100k | ~9 μs | 3e-4 |
+| FastSinCos u3500 | ~10 μs | 3.6e-6 |
+| FastSinCos u35 | ~12 μs | 6e-8 |
+| SIMD.jl built-in sin/cos | ~127 μs | |
+| Base.sincos | ~370 μs | |

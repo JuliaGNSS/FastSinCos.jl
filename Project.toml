@@ -1,6 +1,6 @@
 name = "FastSinCos"
 uuid = "eb71ef10-bbd6-487f-97cc-2efbd12ad3c4"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["Soeren Schoenbrod <soeren.schoenbrod@juliahub.com>"]
 
 [deps]
